@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import time
 import os
+import queue
 import urllib.request
 from pathlib import Path
 
@@ -131,6 +132,8 @@ class YOLOApp(tk.Tk):
         self.det_count   = tk.StringVar(value="DET: 0")
         self.status_var  = tk.StringVar(value="AGUARDANDO")
         self._photo      = None
+        self._frame_queue = queue.Queue(maxsize=1)
+        self.source_is_camera = False
 
         # settings
         self.conf_var    = tk.DoubleVar(value=0.25)
@@ -427,18 +430,46 @@ class YOLOApp(tk.Tk):
         if self.model is None:
             messagebox.showwarning("Sem modelo", "Carregue um modelo primeiro."); return
         if self.running: return
-        src = self.source_var.get().strip()
-        try: src = int(src)
-        except ValueError: pass
-        self.cap = cv2.VideoCapture(src)
+
+        src_txt = self.source_var.get().strip()
+        try:
+            src = int(src_txt)
+            self.source_is_camera = True
+        except ValueError:
+            src = src_txt
+            self.source_is_camera = False
+
+        # No Windows, CAP_DSHOW costuma estabilizar melhor webcams USB/integradas.
+        if os.name == "nt" and self.source_is_camera:
+            self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(src)
+
         if not self.cap.isOpened():
             messagebox.showerror("Erro na fonte", f"Não foi possível abrir: {src}"); return
+
+        # Reduz atraso e evita acúmulo de frames antigos, que causa sensação de piscada/travamento.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if self.source_is_camera:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        # Limpa frames antigos da fila antes de iniciar.
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
         self.running = True; self.paused = False
         self.btn_start.config(state="disabled")
         self.btn_pause.config(state="normal")
         self.btn_stop.config(state="normal")
         self.status_var.set("EXECUTANDO")
+
         threading.Thread(target=self._loop, daemon=True).start()
+        self.after(15, self._process_frame_queue)
 
     def _toggle_pause(self):
         self.paused = not self.paused
@@ -450,6 +481,11 @@ class YOLOApp(tk.Tk):
     def _stop_inference(self):
         self.running = False
         if self.cap: self.cap.release(); self.cap = None
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
         self.btn_start.config(state="normal")
         self.btn_pause.config(state="disabled", text="⏸  PAUSAR")
         self.btn_stop.config(state="disabled")
@@ -459,9 +495,21 @@ class YOLOApp(tk.Tk):
 
     def _loop(self):
         while self.running:
-            if self.paused: time.sleep(0.04); continue
+            if self.paused:
+                time.sleep(0.04)
+                continue
+
+            if self.cap is None:
+                break
+
             ret, frame = self.cap.read()
-            if not ret: self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue
+            if not ret:
+                # Para arquivo de vídeo, volta ao começo. Para câmera, apenas tenta ler de novo.
+                if not self.source_is_camera and self.cap is not None:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                time.sleep(0.02)
+                continue
+
             t0 = time.time()
             results = self.model.predict(
                 source=frame, conf=self.conf_var.get(), iou=self.iou_var.get(),
@@ -469,7 +517,30 @@ class YOLOApp(tk.Tk):
                 verbose=False)
             fps = 1.0 / max(time.time()-t0, 1e-6)
             ann = self._annotate(frame, results[0])
-            self._update_feed(ann, fps, len(results[0].boxes))
+
+            # Nunca atualize Canvas/Tkinter diretamente pela thread.
+            # Colocamos só o frame mais recente na fila; a tela é atualizada no mainloop.
+            self._enqueue_frame(ann, fps, len(results[0].boxes))
+
+    def _enqueue_frame(self, frame, fps, n_det):
+        try:
+            if self._frame_queue.full():
+                self._frame_queue.get_nowait()
+            self._frame_queue.put_nowait((frame, fps, n_det))
+        except queue.Empty:
+            pass
+        except queue.Full:
+            pass
+
+    def _process_frame_queue(self):
+        if not self.running:
+            return
+        try:
+            frame, fps, n_det = self._frame_queue.get_nowait()
+            self._update_feed(frame, fps, n_det)
+        except queue.Empty:
+            pass
+        self.after(15, self._process_frame_queue)
 
     def _annotate(self, frame, result):
         if not self.show_boxes.get(): return frame.copy()

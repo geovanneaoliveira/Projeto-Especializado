@@ -130,6 +130,12 @@ class YOLOApp(tk.Tk):
         self._photo      = None
         self._frame_queue = queue.Queue(maxsize=1)
         self.source_is_camera = False
+        # Cache de dimensão do canvas (atualizado via bind <Configure>)
+        self._canvas_w = 1
+        self._canvas_h = 1
+        # Cache de parâmetros estáticos de inferência
+        self._cached_imgsz  = 640
+        self._cached_device = "cpu"
 
         # Serial State
         self.serial_port = None
@@ -199,7 +205,7 @@ class YOLOApp(tk.Tk):
         #   name  → string do nome da classe
         #   vx,vy → velocidade estimada do centro do box (px/frame)
         #   empty → frames consecutivos sem detecção associada
-        self._lock = None
+        self._locks = []   # lista de locks ativos (um por objeto travado)
 
         # settings
         self.conf_var    = tk.DoubleVar(value=0.25)
@@ -215,12 +221,12 @@ class YOLOApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _reset_inspection_state(self):
-        """Zera a máquina de estados da inspeção e libera o confidence-lock."""
+        """Zera a máquina de estados da inspeção e libera todos os confidence-locks."""
         self._insp_state = "IDLE"
         self._defect_name = ""
         self._consecutive_empty = 0
         self._entry_frames = 0
-        self._lock = None
+        self._locks = []
 
     def F(self, size, weight="normal"):
         return (self.FF, size, weight)
@@ -450,6 +456,10 @@ class YOLOApp(tk.Tk):
         self.feed_canvas.bind("<Configure>", lambda e: self._draw_placeholder())
         self._draw_placeholder()
 
+    def _on_canvas_resize(self, event):
+        self._canvas_w = event.width
+        self._canvas_h = event.height
+
     def _draw_placeholder(self):
         c = self.feed_canvas
         c.update_idletasks()
@@ -542,6 +552,15 @@ class YOLOApp(tk.Tk):
         self.btn_stop.config(state="normal")
         self.status_var.set("EXECUTANDO")
 
+        # Cacheia parâmetros estáticos (imgsz e device não mudam durante a sessão)
+        self._cached_imgsz  = self.imgsz_var.get()
+        self._cached_device = self.device_var.get()
+        # Dimensão do canvas cacheada para evitar winfo na main thread a cada frame
+        self.feed_canvas.update_idletasks()
+        self._canvas_w = self.feed_canvas.winfo_width()
+        self._canvas_h = self.feed_canvas.winfo_height()
+        self.feed_canvas.bind("<Configure>", self._on_canvas_resize)
+
         threading.Thread(target=self._loop, daemon=True).start()
         self.after(15, self._process_frame_queue)
 
@@ -588,24 +607,52 @@ class YOLOApp(tk.Tk):
                 continue
 
             t0 = time.time()
+
+            # Lê vars tkinter UMA VEZ por frame (evita contenção cross-thread)
+            conf   = self.conf_var.get()
+            iou    = self.iou_var.get()
+            imgsz  = self._cached_imgsz   # estático: definido no start
+            device = self._cached_device  # estático: definido no start
+
+            # Lê flags de exibição uma vez (usadas em _annotate)
+            show_boxes  = self.show_boxes.get()
+            show_labels = self.show_labels.get()
+            show_conf   = self.show_conf.get()
+
             results = self.model.predict(
                 source=frame,
-                conf=self.conf_var.get(),
-                iou=self.iou_var.get(),
-                imgsz=self.imgsz_var.get(),
-                device=self.device_var.get(),
+                conf=conf,
+                iou=iou,
+                imgsz=imgsz,
+                device=device,
                 verbose=False
             )
-            fps = 1.0 / max(time.time() - t0, 1e-6)
-            ann = self._annotate(frame, results[0])
-            n_det = len(results[0].boxes)
+            result = results[0]
+            n_det  = len(result.boxes)
 
-            # Atualiza o confidence-lock e sobrepõe a anotação do lock
-            self._update_confidence_lock(results[0])
+            ann = self._annotate(frame, result, show_boxes, show_labels, show_conf)
+            self._update_confidence_lock(result)
             ann = self._annotate_lock(ann)
+            self._handle_serial_trigger(result, n_det)
 
-            self._handle_serial_trigger(results[0], n_det)
-            self._enqueue_frame(ann, fps, n_det)
+            # Resize + conversão de cor aqui (thread de inferência),
+            # aliviando a main thread do tkinter.
+            cw = self._canvas_w
+            ch = self._canvas_h
+            if cw > 1 and ch > 1:
+                fh, fw = ann.shape[:2]
+                scale  = min(cw / fw, ch / fh)
+                nw, nh = int(fw * scale), int(fh * scale)
+                rgb    = cv2.cvtColor(cv2.resize(ann, (nw, nh)), cv2.COLOR_BGR2RGB)
+                photo  = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+                x0, y0 = (cw - nw) // 2, (ch - nh) // 2
+            else:
+                photo  = None
+                x0, y0 = 0, 0
+
+            # FPS do ciclo completo (inferência + annotate + resize)
+            fps = 1.0 / max(time.time() - t0, 1e-6)
+            self._enqueue_frame(photo, fps, n_det, x0, y0, cw, ch)
 
     def _is_defect_class(self, cls_name):
         """Retorna True para classes que indicam defeito (tampa/lacre/nível)."""
@@ -760,27 +807,20 @@ class YOLOApp(tk.Tk):
 
     def _update_confidence_lock(self, result):
         """
-        Atualiza o confidence-lock a partir do resultado YOLO mais recente.
+        Mantém uma lista de locks independentes, um por objeto detectado.
 
-        Lógica:
-          1. Para cada detecção ao vivo com conf >= LOCK_THRESHOLD:
-             - Se não há lock → cria um novo lock.
-             - Se há lock e o IoU com o box atual é suficiente → associa e
-               atualiza a confiança se for maior.
-          2. Se há lock mas nenhuma detecção ao vivo se associa:
-             - Avança o box com a última velocidade conhecida (dead-reckoning).
-             - Incrementa o contador de frames vazios.
-             - Se ultrapassar LOCK_RELEASE_FRAMES → libera o lock.
-          3. Qualquer detecção ao vivo (independente de conf) que bata com
-             o box travado serve para manter o rastreamento vivo e atualizar
-             a posição, mesmo que a conf não supere o limiar.
+        Para cada detecção ao vivo:
+          - Tenta associar ao lock existente com maior IoU (>= LOCK_IOU_MIN).
+          - Se não associa a nenhum lock e conf >= LOCK_THRESHOLD → cria novo lock.
 
-        Retorna o lock atual (dict ou None).
+        Para cada lock sem associação neste frame:
+          - Avança com dead-reckoning.
+          - Libera após LOCK_RELEASE_FRAMES frames sem associação.
         """
         boxes = result.boxes
         names = result.names or {}
 
-        # Coleta todas as detecções ao vivo não ignoradas como listas simples
+        # Coleta detecções ao vivo não ignoradas
         live = []
         for box in boxes:
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
@@ -789,122 +829,122 @@ class YOLOApp(tk.Tk):
             name = str(names.get(cls, cls))
             if self._is_ignored_class(name):
                 continue
-            live.append({"box": [x1, y1, x2, y2], "conf": conf, "cls": cls, "name": name})
+            live.append({"box": [x1, y1, x2, y2], "conf": conf,
+                         "cls": cls, "name": name, "matched": False})
 
-        # ── Sem lock ativo: procura detecção que atinja o limiar ─────────────
-        if self._lock is None:
+        # ── Associa cada detecção ao melhor lock existente ───────────────────
+        for lock in self._locks:
+            best_det = None
+            best_iou = self.LOCK_IOU_MIN
+
             for det in live:
-                if det["conf"] >= self.LOCK_THRESHOLD:
-                    x1, y1, x2, y2 = det["box"]
-                    self._lock = {
-                        "box":   det["box"][:],
-                        "conf":  det["conf"],
-                        "cls":   det["cls"],
-                        "name":  det["name"],
-                        "vx":    0.0,
-                        "vy":    0.0,
-                        "empty": 0,
-                    }
-                    print(f"[LOCK] Travado: '{det['name']}' conf={det['conf']:.3f}")
-                    break   # trava no primeiro que atingir
-            return self._lock
+                iou = self._box_iou(lock["box"], det["box"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det = det
 
-        # ── Lock ativo: tenta associar uma detecção ao vivo ─────────────────
-        lock = self._lock
-        best_det  = None
-        best_iou  = self.LOCK_IOU_MIN   # limiar mínimo para aceitar associação
+            if best_det is not None:
+                best_det["matched"] = True  # marca como consumida
 
+                old_cx = (lock["box"][0] + lock["box"][2]) / 2
+                old_cy = (lock["box"][1] + lock["box"][3]) / 2
+                new_box = best_det["box"]
+                new_cx  = (new_box[0] + new_box[2]) / 2
+                new_cy  = (new_box[1] + new_box[3]) / 2
+
+                alpha = 0.4
+                lock["vx"]    = alpha * (new_cx - old_cx) + (1 - alpha) * lock["vx"]
+                lock["vy"]    = alpha * (new_cy - old_cy) + (1 - alpha) * lock["vy"]
+                lock["box"]   = new_box[:]
+                lock["empty"] = 0
+
+                if best_det["conf"] > lock["conf"]:
+                    print(f"[LOCK] #{lock['id']} conf {lock['conf']:.3f} → {best_det['conf']:.3f}")
+                    lock["conf"] = best_det["conf"]
+                    lock["name"] = best_det["name"]
+                    lock["cls"]  = best_det["cls"]
+            else:
+                # Dead-reckoning
+                lock["empty"] += 1
+                w  = lock["box"][2] - lock["box"][0]
+                h  = lock["box"][3] - lock["box"][1]
+                cx = (lock["box"][0] + lock["box"][2]) / 2 + lock["vx"]
+                cy = (lock["box"][1] + lock["box"][3]) / 2 + lock["vy"]
+                lock["box"] = [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
+                lock["vx"] *= 0.85
+                lock["vy"] *= 0.85
+
+        # Remove locks expirados
+        before = len(self._locks)
+        self._locks = [l for l in self._locks if l["empty"] < self.LOCK_RELEASE_FRAMES]
+        released = before - len(self._locks)
+        if released:
+            print(f"[LOCK] {released} lock(s) liberado(s) por timeout.")
+
+        # ── Cria novos locks para detecções não associadas com conf alta ─────
         for det in live:
-            iou = self._box_iou(lock["box"], det["box"])
-            if iou > best_iou:
-                best_iou = iou
-                best_det = det
-
-        if best_det is not None:
-            # Detecção associada: atualiza posição e velocidade
-            old_cx = (lock["box"][0] + lock["box"][2]) / 2
-            old_cy = (lock["box"][1] + lock["box"][3]) / 2
-            new_box = best_det["box"]
-            new_cx  = (new_box[0] + new_box[2]) / 2
-            new_cy  = (new_box[1] + new_box[3]) / 2
-
-            # Suavização exponencial da velocidade (evita saltos)
-            alpha = 0.4
-            lock["vx"] = alpha * (new_cx - old_cx) + (1 - alpha) * lock["vx"]
-            lock["vy"] = alpha * (new_cy - old_cy) + (1 - alpha) * lock["vy"]
-
-            lock["box"]  = new_box[:]
-            lock["empty"] = 0
-
-            # Melhora a confiança exibida se a detecção atual for maior
-            if best_det["conf"] > lock["conf"]:
-                print(f"[LOCK] Confiança atualizada: {lock['conf']:.3f} → {best_det['conf']:.3f}")
-                lock["conf"] = best_det["conf"]
-                lock["name"] = best_det["name"]
-                lock["cls"]  = best_det["cls"]
-
-        else:
-            # Sem associação: avança o box com dead-reckoning
-            lock["empty"] += 1
-            w = lock["box"][2] - lock["box"][0]
-            h = lock["box"][3] - lock["box"][1]
-            cx = (lock["box"][0] + lock["box"][2]) / 2 + lock["vx"]
-            cy = (lock["box"][1] + lock["box"][3]) / 2 + lock["vy"]
-            lock["box"] = [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
-
-            # Desacelera gradualmente (atrito fictício)
-            lock["vx"] *= 0.85
-            lock["vy"] *= 0.85
-
-            if lock["empty"] >= self.LOCK_RELEASE_FRAMES:
-                print(f"[LOCK] Liberado após {lock['empty']} frames sem detecção.")
-                self._lock = None
-
-        return self._lock
+            if det["matched"]:
+                continue
+            if det["conf"] < self.LOCK_THRESHOLD:
+                continue
+            # Evita criar lock duplicado muito próximo de um já existente
+            too_close = any(
+                self._box_iou(det["box"], l["box"]) >= self.LOCK_IOU_MIN
+                for l in self._locks
+            )
+            if too_close:
+                continue
+            new_id = max((l["id"] for l in self._locks), default=0) + 1
+            self._locks.append({
+                "id":    new_id,
+                "box":   det["box"][:],
+                "conf":  det["conf"],
+                "cls":   det["cls"],
+                "name":  det["name"],
+                "vx":    0.0,
+                "vy":    0.0,
+                "empty": 0,
+            })
+            print(f"[LOCK] #{new_id} criado: '{det['name']}' conf={det['conf']:.3f}")
 
     def _annotate_lock(self, frame):
         """
-        Desenha o box do confidence-lock sobre o frame já anotado.
-        Usa estilo distinto (cor magenta, borda dupla, indicador LOCK).
+        Desenha todos os locks ativos sobre o frame já anotado.
+        Usa estilo distinto (magenta, borda dupla, indicador LOCK #N).
         """
-        if self._lock is None:
+        if not self._locks:
             return frame
-        lock = self._lock
-        out  = frame  # modifica in-place (já é uma cópia de _annotate)
+        out = frame
 
-        x1, y1, x2, y2 = [int(v) for v in lock["box"]]
-        conf = lock["conf"]
-        name = lock["name"].upper()
-
-        # Cor do lock: magenta/violeta para distinguir das caixas normais
-        LOCK_COLOR  = (220, 80, 255)   # BGR
+        LOCK_COLOR  = (220, 80, 255)   # BGR magenta
         LOCK_COLOR2 = (180, 40, 200)
 
-        # Borda externa fina (halo)
-        cv2.rectangle(out, (x1-2, y1-2), (x2+2, y2+2), LOCK_COLOR2, 1)
-        # Borda principal
-        cv2.rectangle(out, (x1, y1), (x2, y2), LOCK_COLOR, 2)
+        for lock in self._locks:
+            x1, y1, x2, y2 = [int(v) for v in lock["box"]]
+            conf = lock["conf"]
+            name = lock["name"].upper()
 
-        # Cantos em destaque (maior que o padrão)
-        cl = 16
-        for px, py, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
-            cv2.line(out, (px, py), (px+dx*cl, py), LOCK_COLOR, 3)
-            cv2.line(out, (px, py), (px, py+dy*cl), LOCK_COLOR, 3)
+            cv2.rectangle(out, (x1-2, y1-2), (x2+2, y2+2), LOCK_COLOR2, 1)
+            cv2.rectangle(out, (x1, y1), (x2, y2), LOCK_COLOR, 2)
 
-        # Rótulo: "🔒 NOME  0.97"
-        label = f"[LOCK] {name}  {conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.48, 1)
-        cv2.rectangle(out, (x1, y1-th-10), (x1+tw+8, y1), LOCK_COLOR, -1)
-        cv2.putText(out, label, (x1+4, y1-5),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+            cl = 16
+            for px, py, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+                cv2.line(out, (px, py), (px+dx*cl, py), LOCK_COLOR, 3)
+                cv2.line(out, (px, py), (px, py+dy*cl), LOCK_COLOR, 3)
+
+            label = f"[LOCK #{lock['id']}] {name}  {conf:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.48, 1)
+            cv2.rectangle(out, (x1, y1-th-10), (x1+tw+8, y1), LOCK_COLOR, -1)
+            cv2.putText(out, label, (x1+4, y1-5),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
         return out
 
-    def _enqueue_frame(self, frame, fps, n_det):
+    def _enqueue_frame(self, photo, fps, n_det, x0, y0, cw, ch):
         try:
             if self._frame_queue.full():
                 self._frame_queue.get_nowait()
-            self._frame_queue.put_nowait((frame, fps, n_det))
+            self._frame_queue.put_nowait((photo, fps, n_det, x0, y0, cw, ch))
         except (queue.Empty, queue.Full):
             pass
 
@@ -912,8 +952,8 @@ class YOLOApp(tk.Tk):
         if not self.running:
             return
         try:
-            frame, fps, n_det = self._frame_queue.get_nowait()
-            self._update_feed(frame, fps, n_det)
+            photo, fps, n_det, x0, y0, cw, ch = self._frame_queue.get_nowait()
+            self._update_feed(photo, fps, n_det, x0, y0, cw, ch)
         except queue.Empty:
             pass
         self.after(15, self._process_frame_queue)
@@ -924,8 +964,8 @@ class YOLOApp(tk.Tk):
         ignored_keywords = ("normal",)
         return any(keyword in name for keyword in ignored_keywords)
 
-    def _annotate(self, frame, result):
-        if not self.show_boxes.get():
+    def _annotate(self, frame, result, show_boxes=True, show_labels=True, show_conf=True):
+        if not show_boxes:
             return frame.copy()
         out = frame.copy()
         names = result.names or {}
@@ -943,9 +983,9 @@ class YOLOApp(tk.Tk):
                 cv2.line(out, (px, py), (px+dx*cl, py), color, 3)
                 cv2.line(out, (px, py), (px, py+dy*cl), color, 3)
             parts = []
-            if self.show_labels.get():
+            if show_labels:
                 parts.append(cls_name.upper())
-            if self.show_conf.get():
+            if show_conf:
                 parts.append(f"{conf:.2f}")
             text = "  ".join(parts)
             if text:
@@ -960,19 +1000,11 @@ class YOLOApp(tk.Tk):
                (141,182,0),(180,140,60),(100,160,200),(200,100,50),(160,160,80)]
         return pal[cls_id % len(pal)]
 
-    def _update_feed(self, frame, fps, n_det):
-        c = self.feed_canvas
-        c.update_idletasks()
-        cw, ch = c.winfo_width(), c.winfo_height()
-        if cw < 2 or ch < 2:
+    def _update_feed(self, photo, fps, n_det, x0, y0, cw, ch):
+        if photo is None:
             return
-        fh, fw = frame.shape[:2]
-        scale = min(cw/fw, ch/fh)
-        nw, nh = int(fw*scale), int(fh*scale)
-        rgb = cv2.cvtColor(cv2.resize(frame, (nw, nh)), cv2.COLOR_BGR2RGB)
-        photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
-        self._photo = photo
-        x0, y0 = (cw-nw)//2, (ch-nh)//2
+        c = self.feed_canvas
+        self._photo = photo   # mantém referência para evitar GC
         c.delete("all")
         c.create_rectangle(0, 0, cw, ch, fill="#111111", outline="")
         c.create_image(x0, y0, anchor="nw", image=photo)

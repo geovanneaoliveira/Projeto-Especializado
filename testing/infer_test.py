@@ -1,8 +1,9 @@
 """
 infer_test.py — Inferência simples com YOLO em arquivo local (sem GUI)
 Uso: python infer_test.py --model best.pt --source imagem.jpg [--conf 0.25] [--iou 0.45] [--show]
-python testing/infer_test.py --model .\models\best\cocacola_yolo26m_inspecao_v1_best.pt --source .\images\IMG-20250630-WA0173.jpg --show
 """
+
+# python testing/infer_test.py --model .\models\best\cocacola_yolo26m_inspecao_v1_best.pt --source .\images\IMG-20250630-WA0173.jpg --show
 
 import argparse
 import sys

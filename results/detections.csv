@@ -1,0 +1,14 @@
+image,class_id,class_name,confidence,x1,y1,x2,y2
+c4.jpg,2,Defeito - rotulo,0.9637,267.18,759.98,501.71,950.97
+c4.jpg,3,Defeito - sem_tampa,0.9119,272.91,486.77,408.88,589.26
+n1.jpeg,1,Defeito - liquido_abaixo,0.9655,113.97,248.12,241.35,311.88
+n2.jpeg,0,Defeito - lacre_defeituoso,0.9681,217.16,133.67,298.67,197.12
+n3.jpeg,2,Defeito - rotulo,0.9669,380.78,290.98,509.97,400.13
+n4.jpeg,1,Defeito - liquido_abaixo,0.9619,449.29,321.16,618.2,410.19
+n4.jpeg,3,Defeito - sem_tampa,0.9545,485.76,190.87,600.4,272.76
+z1.png,1,Defeito - liquido_abaixo,0.9495,139.94,309.79,234.93,348.13
+z1.png,0,Defeito - lacre_defeituoso,0.8454,51.91,82.8,95.07,115.99
+z1.png,3,Defeito - sem_tampa,0.8361,214.71,16.57,255.82,47.55
+z1.png,0,Defeito - lacre_defeituoso,0.8159,318.83,77.18,356.03,112.3
+z1.png,2,Defeito - rotulo,0.5716,23.54,177.84,123.4,273.58
+z3.png,3,Defeito - sem_tampa,0.6915,180.48,34.82,291.67,129.1
